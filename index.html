@@ -1,0 +1,700 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Portfolio</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root {
+      --bg: #efeee9;          /* page colour */
+      --tile: #e2e0d9;        /* colour shown while an image loads */
+      --radius: 2px;          /* corner rounding of the images */
+      --backdrop: rgba(239, 238, 233, 0.86);
+    }
+
+    html, body {
+      margin: 0;
+      height: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      overscroll-behavior: none;
+    }
+
+    body {
+      cursor: grab;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+      touch-action: none;
+      opacity: 0;
+      transition: opacity 0.8s ease;
+    }
+    body.ready { opacity: 1; }
+    body.dragging, body.dragging * { cursor: grabbing !important; }
+
+    /* ---------- infinite grid ---------- */
+
+    #world {
+      position: fixed;
+      inset: 0;
+      overflow: hidden;
+    }
+
+    .tile {
+      position: absolute;
+      left: 0;
+      top: 0;
+      background: var(--tile);
+      border-radius: var(--radius);
+      overflow: hidden;
+      will-change: transform;
+      contain: layout paint;
+      cursor: pointer;
+    }
+    body.dragging .tile { cursor: grabbing; }
+
+    .tile img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.5s ease;
+    }
+    .tile img.loaded { opacity: 1; }
+    .tile.hidden { visibility: hidden; }
+
+    /* ---------- enlarged view ---------- */
+
+    #overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 10;
+      pointer-events: none;
+    }
+    #overlay.active { pointer-events: auto; cursor: zoom-out; }
+
+    #backdrop {
+      position: absolute;
+      inset: 0;
+      background: var(--backdrop);
+      -webkit-backdrop-filter: blur(14px);
+      backdrop-filter: blur(14px);
+      opacity: 0;
+      transition: opacity 0.45s ease;
+    }
+    #overlay.open #backdrop { opacity: 1; }
+
+    .card {
+      position: absolute;
+      transform-origin: 50% 50%;
+      border-radius: var(--radius);
+      overflow: hidden;
+      will-change: transform;
+      cursor: grab;
+      background: var(--tile);
+    }
+    .card img {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      pointer-events: none;
+    }
+    .card .glare {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      mix-blend-mode: soft-light;
+      opacity: 0;
+    }
+  </style>
+</head>
+<body>
+  <div id="world"></div>
+  <div id="overlay"><div id="backdrop"></div></div>
+
+  <script>
+    (() => {
+      'use strict';
+
+      // ---------------------------------------------------------------- settings
+      const FRICTION = 3.4;          // how quickly a flung grid slows down (higher = sooner)
+      const MAX_FLING = 4500;        // px/s cap on grid fling speed
+      const CLOSE_FLICK = 1400;      // px/s — flick the enlarged image this fast to close it
+      const CLOSE_DIST = 0.32;       // …or drag it this far (fraction of the screen)
+
+      // Every image in the images/ folder is shown — just add or remove files there.
+      // On GitHub Pages the list of files is read from GitHub; when previewing on your
+      // computer it's read from the folder. Only needed with a custom domain (your own
+      // web address): fill in your GitHub username and repository name.
+      const IMAGE_FOLDER = 'images';
+      const GITHUB_USER = '';
+      const GITHUB_REPO = '';
+
+      const world = document.getElementById('world');
+      const overlay = document.getElementById('overlay');
+      const body = document.body;
+
+      // ---------------------------------------------------------------- helpers
+      const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+      const mod = (a, n) => ((a % n) + n) % n;
+      const now = () => performance.now();
+
+      function mulberry32(a) {
+        return () => {
+          a |= 0; a = (a + 0x6d2b79f5) | 0;
+          let t = Math.imul(a ^ (a >>> 15), 1 | a);
+          t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+      function shuffle(arr, rand) {
+        for (let i = arr.length - 1; i > 0; i--) {
+          const j = Math.floor(rand() * (i + 1));
+          [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+        return arr;
+      }
+
+      // Tracks pointer positions over the last ~100 ms to estimate velocity (px/s).
+      class Velocity {
+        constructor() { this.s = []; }
+        reset() { this.s.length = 0; }
+        add(x, y) {
+          const t = now();
+          this.s.push({ x, y, t });
+          while (this.s.length > 2 && t - this.s[0].t > 100) this.s.shift();
+        }
+        get() {
+          const s = this.s;
+          if (s.length < 2) return { x: 0, y: 0 };
+          const a = s[0], b = s[s.length - 1];
+          if (now() - b.t > 70) return { x: 0, y: 0 }; // pointer has been held still
+          const dt = Math.max(0.008, (b.t - a.t) / 1000);
+          return { x: (b.x - a.x) / dt, y: (b.y - a.y) / dt };
+        }
+      }
+
+      // ---------------------------------------------------------------- images
+      let IMGS = []; // { url, ar }
+
+      const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif)$/i;
+
+      async function listImages() {
+        // 1. GitHub Pages: ask GitHub which files are in the folder (cached for 10 min)
+        let user = GITHUB_USER, repo = GITHUB_REPO;
+        const host = location.hostname;
+        if (!user && host.endsWith('.github.io')) {
+          user = host.split('.')[0];
+          const first = location.pathname.split('/').filter(Boolean)[0];
+          repo = first && !first.includes('.') ? first : host;
+        }
+        if (user && repo) {
+          const cacheKey = `imgs:${user}/${repo}`;
+          try {
+            const c = JSON.parse(sessionStorage.getItem(cacheKey) || 'null');
+            if (c && Date.now() - c.t < 600000) return c.names;
+          } catch (_) {}
+          try {
+            const r = await fetch(`https://api.github.com/repos/${user}/${repo}/contents/${IMAGE_FOLDER}`);
+            if (r.ok) {
+              const names = (await r.json())
+                .filter((f) => f.type === 'file' && IMAGE_EXT.test(f.name)).map((f) => f.name);
+              try { sessionStorage.setItem(cacheKey, JSON.stringify({ t: Date.now(), names })); } catch (_) {}
+              if (names.length) return names;
+            }
+          } catch (_) {}
+        }
+        // 2. Local preview: read the folder listing the preview server shows
+        try {
+          const r = await fetch(IMAGE_FOLDER + '/');
+          if (r.ok) {
+            const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+            const names = [...doc.querySelectorAll('a[href]')]
+              .map((a) => decodeURIComponent(a.getAttribute('href').split('/').pop()))
+              .filter((n) => IMAGE_EXT.test(n));
+            return [...new Set(names)];
+          }
+        } catch (_) {}
+        return [];
+      }
+
+      // load every image once to learn its proportions
+      async function loadImages() {
+        const names = await listImages();
+        const list = await Promise.all(names.map((name) => new Promise((res) => {
+          const url = IMAGE_FOLDER + '/' + encodeURIComponent(name);
+          const im = new Image();
+          im.onload = () => res({ url, ar: im.naturalWidth / im.naturalHeight });
+          im.onerror = () => res(null);
+          im.src = url;
+        })));
+        return list.filter(Boolean);
+      }
+
+      // ---------------------------------------------------------------- layout
+      // A set of masonry columns that all repeat vertically with the same period;
+      // the set of columns repeats horizontally.
+      const seed = Math.floor(Math.random() * 1e9);
+      let colW, gap, stride, nCols, cols = [];
+
+      function layout() {
+        const vw = innerWidth, vh = innerHeight;
+        const perRow = vw < 640 ? 2.3 : vw < 1100 ? 4 : vw < 1700 ? 5.5 : 6.5;
+        colW = Math.round(clamp(vw / perRow, 120, 340));
+        gap = Math.round(clamp(colW * 0.08, 8, 22));
+        stride = colW + gap;
+        nCols = Math.max(Math.ceil(vw / stride) + 3, 8);
+
+        const rand = mulberry32(seed);
+        const n = IMGS.length;
+        const hOf = (i) => Math.round(colW / clamp(IMGS[i].ar, 0.35, 3));
+        const avg = IMGS.reduce((sum, _, i) => sum + hOf(i) + gap, 0) / n;
+
+        // All columns share one repeat height P, so neighbouring columns keep the same
+        // position relative to each other forever and can be checked while placing.
+        const perCol = Math.max(Math.ceil((vh * 1.6) / avg), Math.ceil(n / nCols), 2);
+        const P = Math.round(perCol * avg);
+        cols = Array.from({ length: nCols }, () => ({ items: [], h: 0, full: false, phase: rand() * P, P }));
+        const used = new Array(n).fill(0);
+        const all = IMGS.map((_, i) => i);
+
+        // free space between a new item (column c, local y, height h) and an existing one
+        // (column cc, item it), measured around the repeat; negative = they overlap
+        const space = (c, y, h, cc, it) => {
+          const d = mod(cc.phase + it.y - (c.phase + y), P);
+          return Math.min(d - h, P - d - it.h);
+        };
+        // strict first (no repeat within ~one image in the same column, none beside it
+        // in the neighbouring columns), then looser, then anything
+        const tiers = [
+          { same: avg * 1.2, side: avg * 0.6 },
+          { same: gap + 1, side: 1 },
+          null,
+        ];
+        const clashes = (i, b, y, h, t) => {
+          if (!t) return false;
+          for (let o = -1; o <= 1; o++) {
+            const cc = cols[mod(b + o, nCols)];
+            const m = o === 0 ? t.same : t.side;
+            for (const it of cc.items) if (it.idx === i && space(cols[b], y, h, cc, it) < m) return true;
+          }
+          return false;
+        };
+
+        let guard = 0;
+        while (cols.some((c) => !c.full) && guard++ < 20000) {
+          let b = -1;
+          for (let i = 0; i < nCols; i++) if (!cols[i].full && (b < 0 || cols[i].h < cols[b].h)) b = i;
+          const c = cols[b];
+          const R = P - c.h;
+          const fitting = R < avg * 1.6; // near the end: pick what fills the column best
+          const order = shuffle(all.slice(), rand).sort((x, y) => used[x] - used[y]);
+          let pick = -1;
+          for (const t of tiers) {
+            let bestErr = Infinity;
+            for (const i of order) {
+              const h = hOf(i);
+              if (clashes(i, b, c.h, h, t)) continue;
+              if (!fitting) { pick = i; break; }
+              const err = Math.abs(R - (h + gap));
+              if (err < bestErr) { bestErr = err; pick = i; }
+            }
+            if (pick >= 0) break;
+          }
+          const h = hOf(pick);
+          c.items.push({ idx: pick, y: c.h, h });
+          c.h += h + gap;
+          used[pick]++;
+          if (P - c.h <= avg * 0.5) c.full = true;
+        }
+
+        // make every column exactly P tall: stretch images a tiny bit (max 5%),
+        // spread whatever is left over the gaps
+        for (const c of cols) {
+          const S = c.items.reduce((sum, it) => sum + it.h, 0);
+          const f = clamp((P - c.items.length * gap) / S, 0.95, 1.05);
+          const extra = (P - S * f - c.items.length * gap) / c.items.length;
+          let y = 0;
+          for (const it of c.items) { it.h *= f; it.y = y; y += it.h + gap + extra; }
+        }
+
+        // drop every live tile so it is rebuilt with the new sizes
+        for (const el of active.values()) release(el);
+        active.clear();
+        dirty = true;
+      }
+
+      // ---------------------------------------------------------------- rendering
+      const cam = { x: 0, y: 0 };
+      let camVel = { x: 0, y: 0 };
+      let dirty = true;
+      let frame = 0;
+      const active = new Map(); // key -> element
+      const pool = [];
+
+      function acquire(item, key) {
+        let el = pool.pop();
+        if (!el) {
+          el = document.createElement('div');
+          el.className = 'tile';
+          const img = document.createElement('img');
+          img.alt = '';
+          img.draggable = false;
+          img.decoding = 'async';
+          img.addEventListener('load', () => img.classList.add('loaded'));
+          el.appendChild(img);
+          world.appendChild(el);
+        }
+        const img = el.firstChild;
+        const url = IMGS[item.idx].url;
+        if (el._url !== url) {
+          img.classList.remove('loaded');
+          img.src = url;
+          el._url = url;
+          if (img.complete && img.naturalWidth) img.classList.add('loaded');
+        }
+        el._idx = item.idx;
+        el._key = key;
+        el.classList.remove('hidden');
+        el.style.width = colW + 'px';
+        el.style.height = item.h + 'px';
+        el.style.display = '';
+        return el;
+      }
+      function release(el) {
+        el.style.display = 'none';
+        el._key = null;
+        el.classList.remove('hidden');
+        pool.push(el);
+      }
+
+      function render() {
+        frame++;
+        const vw = innerWidth, vh = innerHeight, m = 160;
+        const k0 = Math.floor((cam.x - m) / stride);
+        const k1 = Math.floor((cam.x + vw + m) / stride);
+        for (let k = k0; k <= k1; k++) {
+          const col = cols[mod(k, nCols)];
+          const x = k * stride - cam.x;
+          const r0 = Math.floor((cam.y - m - col.phase) / col.P) - 1;
+          const r1 = Math.floor((cam.y + vh + m - col.phase) / col.P);
+          for (let r = r0; r <= r1; r++) {
+            const base = col.phase + r * col.P;
+            for (let i = 0; i < col.items.length; i++) {
+              const it = col.items[i];
+              const y = base + it.y;
+              if (y + it.h < cam.y - m || y > cam.y + vh + m) continue;
+              const key = k + '|' + r + '|' + i;
+              let el = active.get(key);
+              if (!el) { el = acquire(it, key); active.set(key, el); }
+              el._frame = frame;
+              el.style.transform = `translate3d(${x}px,${y - cam.y}px,0)`;
+            }
+          }
+        }
+        for (const [key, el] of active) {
+          if (el._frame !== frame) { release(el); active.delete(key); }
+        }
+      }
+
+      // ---------------------------------------------------------------- grid input
+      const gridVel = new Velocity();
+      let g = null; // current grid drag
+
+      world.addEventListener('pointerdown', (e) => {
+        if (card || g) return;
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        const wasMoving = Math.hypot(camVel.x, camVel.y) > 80;
+        g = {
+          id: e.pointerId, sx: e.clientX, sy: e.clientY, cx: cam.x, cy: cam.y, moved: 0,
+          tile: wasMoving ? null : e.target.closest('.tile'),
+        };
+        camVel = { x: 0, y: 0 };
+        gridVel.reset();
+        gridVel.add(cam.x, cam.y);
+        try { world.setPointerCapture(e.pointerId); } catch (_) {}
+      });
+      world.addEventListener('pointermove', (e) => {
+        if (!g || e.pointerId !== g.id) return;
+        const dx = e.clientX - g.sx, dy = e.clientY - g.sy;
+        g.moved = Math.max(g.moved, Math.hypot(dx, dy));
+        if (g.moved > 4) body.classList.add('dragging');
+        cam.x = g.cx - dx;
+        cam.y = g.cy - dy;
+        gridVel.add(cam.x, cam.y);
+        dirty = true;
+      });
+      function endGrid(e, cancelled) {
+        if (!g || e.pointerId !== g.id) return;
+        body.classList.remove('dragging');
+        const v = gridVel.get();
+        const sp = Math.hypot(v.x, v.y);
+        const f = sp > MAX_FLING ? MAX_FLING / sp : 1;
+        camVel = { x: v.x * f, y: v.y * f };
+        if (!cancelled && g.moved < 6 && g.tile) openCard(g.tile);
+        g = null;
+      }
+      world.addEventListener('pointerup', (e) => endGrid(e, false));
+      world.addEventListener('pointercancel', (e) => endGrid(e, true));
+
+      addEventListener('wheel', (e) => {
+        e.preventDefault();
+        if (card) return;
+        const m = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
+        cam.x += e.deltaX * m;
+        cam.y += e.deltaY * m;
+        camVel = { x: 0, y: 0 };
+        dirty = true;
+      }, { passive: false });
+
+      addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') return closeCard();
+        if (card) return;
+        const push = 900;
+        if (e.key === 'ArrowLeft') camVel.x -= push;
+        else if (e.key === 'ArrowRight') camVel.x += push;
+        else if (e.key === 'ArrowUp') camVel.y -= push;
+        else if (e.key === 'ArrowDown') camVel.y += push;
+      });
+
+      // ---------------------------------------------------------------- enlarged card
+      let card = null;
+      const cardVel = new Velocity();
+
+      function tileGeom(r) {
+        return {
+          x: r.left + r.width / 2 - innerWidth / 2,
+          y: r.top + r.height / 2 - innerHeight / 2,
+          s: r.width / card.W,
+        };
+      }
+      function setCardGeometry() {
+        const vw = innerWidth, vh = innerHeight, small = vw < 640;
+        const mw = vw * (small ? 0.88 : 0.78), mh = vh * (small ? 0.72 : 0.82);
+        let W = mw, H = W / card.ar;
+        if (H > mh) { H = mh; W = H * card.ar; }
+        card.W = W; card.H = H;
+        Object.assign(card.el.style, {
+          width: W + 'px', height: H + 'px',
+          left: (vw - W) / 2 + 'px', top: (vh - H) / 2 + 'px',
+        });
+      }
+
+      function openCard(tile) {
+        const item = IMGS[tile._idx];
+        const el = document.createElement('div');
+        el.className = 'card';
+        const img = document.createElement('img');
+        img.src = item.url; img.alt = ''; img.draggable = false;
+        const glare = document.createElement('div');
+        glare.className = 'glare';
+        el.append(img, glare);
+        overlay.appendChild(el);
+
+        card = {
+          el, glare, tile, key: tile._key, ar: item.ar,
+          x: 0, y: 0, s: 1, vx: 0, vy: 0, vs: 0,
+          tx: 0, ty: 0, ts: 1, K: 210, D: 21,
+          rx: 0, ry: 0, rz: 0, hx: 0, hy: 0, lift: 0,
+          dragging: false, closing: false, drag: null,
+        };
+        setCardGeometry();
+        const geo = tileGeom(tile.getBoundingClientRect());
+        card.x = geo.x; card.y = geo.y; card.s = card.s0 = geo.s;
+        tile.classList.add('hidden');
+        camVel = { x: 0, y: 0 };
+        overlay.classList.add('active');
+        requestAnimationFrame(() => overlay.classList.add('open'));
+        applyCard(0);
+      }
+
+      function closeCard() {
+        if (!card || card.closing) return;
+        const c = card;
+        c.closing = true;
+        c.dragging = false;
+        c.hx = c.hy = 0;
+        body.classList.remove('dragging');
+        overlay.classList.remove('open');
+        const t = c.tile;
+        if (t.isConnected && t._key === c.key && t.style.display !== 'none') {
+          const geo = tileGeom(t.getBoundingClientRect());
+          c.tx = geo.x; c.ty = geo.y; c.ts = geo.s;
+          c.K = 240; c.D = 31;
+          const sp = Math.hypot(c.vx, c.vy);
+          if (sp > 2600) { c.vx *= 2600 / sp; c.vy *= 2600 / sp; }
+        } else {
+          // the original tile is gone (e.g. after a resize) — just fade away
+          c.tx = c.x; c.ty = c.y + 30; c.ts = c.s * 0.92;
+          c.el.style.transition = 'opacity 0.35s ease';
+          c.el.style.opacity = '0';
+          c.fade = true;
+        }
+      }
+
+      function finishClose() {
+        const c = card;
+        if (c.tile._key === c.key) c.tile.classList.remove('hidden');
+        c.el.remove();
+        overlay.classList.remove('active');
+        card = null;
+      }
+
+      overlay.addEventListener('pointerdown', (e) => {
+        if (!card || card.closing) return;
+        const c = card;
+        if (e.target.closest('.card')) {
+          c.dragging = true;
+          c.ts = 1.04;
+          c.drag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: c.x, oy: c.y };
+          cardVel.reset();
+          cardVel.add(c.x, c.y);
+          try { c.el.setPointerCapture(e.pointerId); } catch (_) {}
+          body.classList.add('dragging');
+        } else {
+          c.backdrop = { id: e.pointerId, x: e.clientX, y: e.clientY };
+        }
+      });
+      overlay.addEventListener('pointermove', (e) => {
+        if (!card) return;
+        const c = card;
+        if (c.dragging && e.pointerId === c.drag.id) {
+          c.x = c.drag.ox + (e.clientX - c.drag.sx);
+          c.y = c.drag.oy + (e.clientY - c.drag.sy);
+          cardVel.add(c.x, c.y);
+        } else if (!c.closing && e.pointerType === 'mouse') {
+          // subtle tilt towards the cursor
+          const hw = (c.W * c.s) / 2, hh = (c.H * c.s) / 2;
+          const nx = (e.clientX - (innerWidth / 2 + c.x)) / hw;
+          const ny = (e.clientY - (innerHeight / 2 + c.y)) / hh;
+          const inside = Math.abs(nx) <= 1.15 && Math.abs(ny) <= 1.15;
+          c.hx = inside ? clamp(nx, -1, 1) : 0;
+          c.hy = inside ? clamp(ny, -1, 1) : 0;
+        }
+      });
+      function endCard(e) {
+        if (!card) return;
+        const c = card;
+        if (c.dragging && e.pointerId === c.drag.id) {
+          c.dragging = false;
+          c.ts = 1;
+          body.classList.remove('dragging');
+          const v = cardVel.get();
+          c.vx = v.x; c.vy = v.y;
+          const speed = Math.hypot(v.x, v.y);
+          const dist = Math.hypot(c.x, c.y);
+          if (e.type !== 'pointercancel' &&
+              (speed > CLOSE_FLICK || dist > Math.min(innerWidth, innerHeight) * CLOSE_DIST)) {
+            closeCard();
+          } else {
+            c.tx = 0; c.ty = 0; c.K = 260; c.D = 17; // springy return
+          }
+        } else if (c.backdrop && e.pointerId === c.backdrop.id) {
+          const moved = Math.hypot(e.clientX - c.backdrop.x, e.clientY - c.backdrop.y);
+          c.backdrop = null;
+          if (moved < 8 && e.type === 'pointerup') closeCard();
+        }
+      }
+      overlay.addEventListener('pointerup', endCard);
+      overlay.addEventListener('pointercancel', endCard);
+      overlay.addEventListener('pointerleave', () => { if (card) card.hx = card.hy = 0; });
+
+      function stepCard(dt) {
+        const c = card;
+        const steps = Math.ceil(dt / (1 / 240));
+        const h = dt / steps;
+        for (let i = 0; i < steps; i++) {
+          if (!c.dragging) {
+            c.vx += (-c.K * (c.x - c.tx) - c.D * c.vx) * h;
+            c.vy += (-c.K * (c.y - c.ty) - c.D * c.vy) * h;
+            c.x += c.vx * h;
+            c.y += c.vy * h;
+          }
+          const KS = c.closing ? 260 : 230, DS = c.closing ? 32 : 22;
+          c.vs += (-KS * (c.s - c.ts) - DS * c.vs) * h;
+          c.s += c.vs * h;
+        }
+        if (c.dragging) { const v = cardVel.get(); c.vx = v.x; c.vy = v.y; }
+
+        applyCard(dt);
+
+        if (c.closing) {
+          const settled = Math.abs(c.x - c.tx) < 0.6 && Math.abs(c.y - c.ty) < 0.6 &&
+            Math.abs(c.s - c.ts) < 0.004 && Math.hypot(c.vx, c.vy) < 30 && Math.abs(c.vs) < 0.05;
+          if (settled || (c.fade && (c.fadeT = (c.fadeT || 0) + dt) > 0.4)) finishClose();
+        }
+      }
+
+      function applyCard(dt) {
+        const c = card;
+        // tilt from movement (like an album cover you can fling around) + from hover
+        const tz = clamp(c.vx * 0.005, -12, 12);
+        const ty = clamp(c.vx * 0.011, -22, 22) + c.hx * 8;
+        const tx = clamp(-c.vy * 0.011, -22, 22) - c.hy * 8;
+        const f = dt ? 1 - Math.exp(-dt * 11) : 1;
+        c.rz += (tz - c.rz) * f;
+        c.ry += (ty - c.ry) * f;
+        c.rx += (tx - c.rx) * f;
+        c.lift += ((c.dragging ? 1 : 0) - c.lift) * (dt ? 1 - Math.exp(-dt * 8) : 0);
+
+        c.el.style.transform =
+          `translate3d(${c.x}px,${c.y}px,0) perspective(1400px) rotateX(${c.rx}deg) rotateY(${c.ry}deg) rotateZ(${c.rz}deg) scale(${c.s})`;
+
+        const p = c.s0 < 1 ? clamp((c.s - c.s0) / (1 - c.s0), 0, 1) : 1;
+        const L = c.lift;
+        c.el.style.boxShadow =
+          `0 ${(10 + 26 * L) * p}px ${(36 + 60 * L) * p}px rgba(0,0,0,${(0.16 + 0.1 * L) * p})`;
+
+        const tilt = Math.min(1, Math.hypot(c.rx, c.ry) / 18);
+        c.glare.style.opacity = (tilt * p).toFixed(3);
+        c.glare.style.background =
+          `radial-gradient(circle at ${50 - c.ry * 2.5}% ${50 + c.rx * 2.5}%, rgba(255,255,255,0.85), rgba(255,255,255,0) 60%)`;
+      }
+
+      // ---------------------------------------------------------------- loop
+      let last = now();
+      function tick(t) {
+        const dt = Math.min(0.05, (t - last) / 1000);
+        last = t;
+        if (!g && !card) {
+          if (Math.abs(camVel.x) > 3 || Math.abs(camVel.y) > 3) {
+            cam.x += camVel.x * dt;
+            cam.y += camVel.y * dt;
+            const k = Math.exp(-dt * FRICTION);
+            camVel.x *= k; camVel.y *= k;
+            dirty = true;
+          } else camVel.x = camVel.y = 0;
+        }
+        if (dirty) { render(); dirty = false; }
+        if (card) stepCard(dt);
+        requestAnimationFrame(tick);
+      }
+
+      let resizeTimer;
+      addEventListener('resize', () => {
+        clearTimeout(resizeTimer);
+        resizeTimer = setTimeout(() => {
+          layout();
+          if (card && !card.closing) setCardGeometry();
+        }, 120);
+      });
+
+      // ---------------------------------------------------------------- start
+      loadImages().then((list) => {
+        IMGS = list;
+        if (!IMGS.length) return;
+        layout();
+        cam.x = Math.random() * nCols * stride;
+        cam.y = Math.random() * 4000;
+        render();
+        requestAnimationFrame(() => body.classList.add('ready'));
+        requestAnimationFrame(tick);
+      });
+    })();
+  </script>
+</body>
+</html>
