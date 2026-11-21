@@ -7,8 +7,8 @@
   <link rel="icon" href="data:,">
   <style>
     :root {
-      --bg: #efeee9;          /* page colour */
-      --tile: #e2e0d9;        /* colour shown while an image loads */
+      --bg: #e2e2e2;          /* page colour */
+      --tile: #e2e2e2;          /* colour shown while an image loads */
       --radius: 2px;          /* corner rounding of the images */
       --backdrop: rgba(239, 238, 233, 0.86);
     }
@@ -134,6 +134,25 @@
       const GITHUB_USER = '';
       const GITHUB_REPO = '';
 
+      // Only used when you open index.html by double-clicking it: the browser then
+      // isn't allowed to look inside the images folder, so it uses this list instead.
+      // Online it isn't needed. Add a name here if you want to see a new image offline.
+      const IMAGES = [
+        '2luik.jpg',
+        'apl.jpg',
+        'Artboard2.jpg',
+        'bocheltje2.jpg',
+        'bonk.jpg',
+        'cat swirl.jpg',
+        'elek cat.jpg',
+        'face.jpg',
+        'migraine.webp',
+        'snail.jpg',
+        'snakeaplle.jpg',
+        'sterrenmannetje.jpg',
+        'tie.jpg',
+      ];
+
       const world = document.getElementById('world');
       const overlay = document.getElementById('overlay');
       const body = document.body;
@@ -184,6 +203,7 @@
       const IMAGE_EXT = /\.(jpe?g|png|gif|webp|avif)$/i;
 
       async function listImages() {
+        if (location.protocol === 'file:') return IMAGES; // opened by double-click
         // 1. GitHub Pages: ask GitHub which files are in the folder (cached for 10 min)
         let user = GITHUB_USER, repo = GITHUB_REPO;
         const host = location.hostname;
@@ -216,10 +236,10 @@
             const names = [...doc.querySelectorAll('a[href]')]
               .map((a) => decodeURIComponent(a.getAttribute('href').split('/').pop()))
               .filter((n) => IMAGE_EXT.test(n));
-            return [...new Set(names)];
+            if (names.length) return [...new Set(names)];
           }
         } catch (_) {}
-        return [];
+        return IMAGES;
       }
 
       // load every image once to learn its proportions
@@ -236,91 +256,60 @@
       }
 
       // ---------------------------------------------------------------- layout
-      // A set of masonry columns that all repeat vertically with the same period;
-      // the set of columns repeats horizontally.
+      // Images are scattered over one big rectangle that repeats endlessly in every
+      // direction. Nothing overlaps (also across the edges where it repeats), and the
+      // same image is never placed close to itself.
+      const SPREAD = 0.4;             // how much of the page is covered (0.25 = airy, 0.45 = full)
+      const GAP = 0.12;               // least space between images, relative to the image size
       const seed = Math.floor(Math.random() * 1e9);
-      let colW, gap, stride, nCols, cols = [];
+      let TW = 1, TH = 1, maxSide = 0, items = [];
 
       function layout() {
         const vw = innerWidth, vh = innerHeight;
-        const perRow = vw < 640 ? 2.3 : vw < 1100 ? 4 : vw < 1700 ? 5.5 : 6.5;
-        colW = Math.round(clamp(vw / perRow, 120, 340));
-        gap = Math.round(clamp(colW * 0.08, 8, 22));
-        stride = colW + gap;
-        nCols = Math.max(Math.ceil(vw / stride) + 3, 8);
-
+        const base = vw < 640 ? vw * 0.42 : clamp(vw / 6.5, 150, 320); // normal image width
+        const pad = base * GAP;
         const rand = mulberry32(seed);
         const n = IMGS.length;
-        const hOf = (i) => Math.round(colW / clamp(IMGS[i].ar, 0.35, 3));
-        const avg = IMGS.reduce((sum, _, i) => sum + hOf(i) + gap, 0) / n;
-
-        // All columns share one repeat height P, so neighbouring columns keep the same
-        // position relative to each other forever and can be checked while placing.
-        const perCol = Math.max(Math.ceil((vh * 1.6) / avg), Math.ceil(n / nCols), 2);
-        const P = Math.round(perCol * avg);
-        cols = Array.from({ length: nCols }, () => ({ items: [], h: 0, full: false, phase: rand() * P, P }));
-        const used = new Array(n).fill(0);
-        const all = IMGS.map((_, i) => i);
-
-        // free space between a new item (column c, local y, height h) and an existing one
-        // (column cc, item it), measured around the repeat; negative = they overlap
-        const space = (c, y, h, cc, it) => {
-          const d = mod(cc.phase + it.y - (c.phase + y), P);
-          return Math.min(d - h, P - d - it.h);
+        const avgArea = base * base * 0.85;
+        // every image covers the same surface, whatever its shape
+        const sizeOf = (i) => {
+          const ar = clamp(IMGS[i].ar, 0.25, 4);
+          return { w: Math.sqrt(avgArea * ar), h: Math.sqrt(avgArea / ar) };
         };
-        // strict first (no repeat within ~one image in the same column, none beside it
-        // in the neighbouring columns), then looser, then anything
-        const tiers = [
-          { same: avg * 1.2, side: avg * 0.6 },
-          { same: gap + 1, side: 1 },
-          null,
-        ];
-        const clashes = (i, b, y, h, t) => {
-          if (!t) return false;
-          for (let o = -1; o <= 1; o++) {
-            const cc = cols[mod(b + o, nCols)];
-            const m = o === 0 ? t.same : t.side;
-            for (const it of cc.items) if (it.idx === i && space(cols[b], y, h, cc, it) < m) return true;
+
+        // big enough that a repeat is never on screen twice and every image fits once
+        const area = Math.max(vw * 1.8 * vh * 1.8, (n * avgArea) / SPREAD);
+        TW = Math.max(Math.sqrt(area * (vw / vh)), vw * 1.8);
+        TH = Math.max(area / TW, vh * 1.8);
+        const target = Math.max(n, Math.round((TW * TH * SPREAD) / avgArea));
+
+        items = [];
+        const fits = (cx, cy, w, h, idx, near) => {
+          for (const it of items) {
+            const dx = Math.abs(mod(it.cx - cx + TW / 2, TW) - TW / 2);
+            const dy = Math.abs(mod(it.cy - cy + TH / 2, TH) - TH / 2);
+            if (dx < (w + it.w) / 2 + pad && dy < (h + it.h) / 2 + pad) return false;
+            if (it.idx === idx && Math.hypot(dx, dy) < near) return false;
           }
-          return false;
+          return true;
         };
-
-        let guard = 0;
-        while (cols.some((c) => !c.full) && guard++ < 20000) {
-          let b = -1;
-          for (let i = 0; i < nCols; i++) if (!cols[i].full && (b < 0 || cols[i].h < cols[b].h)) b = i;
-          const c = cols[b];
-          const R = P - c.h;
-          const fitting = R < avg * 1.6; // near the end: pick what fills the column best
-          const order = shuffle(all.slice(), rand).sort((x, y) => used[x] - used[y]);
-          let pick = -1;
-          for (const t of tiers) {
-            let bestErr = Infinity;
-            for (const i of order) {
-              const h = hOf(i);
-              if (clashes(i, b, c.h, h, t)) continue;
-              if (!fitting) { pick = i; break; }
-              const err = Math.abs(R - (h + gap));
-              if (err < bestErr) { bestErr = err; pick = i; }
+        let bag = [], misses = 0;
+        while (items.length < target && misses < 40) {
+          if (!bag.length) bag = shuffle(IMGS.map((_, i) => i), rand);
+          const idx = bag.pop();
+          const { w, h } = sizeOf(idx);
+          let placed = false;
+          for (let t = 0; t < 500 && !placed; t++) {
+            // try random spots; later attempts may sit a bit closer to its own copies
+            const cx = rand() * TW, cy = rand() * TH;
+            if (fits(cx, cy, w, h, idx, t < 300 ? base * 3 : base * 1.3)) {
+              items.push({ idx, cx, cy, w, h, x: cx - w / 2, y: cy - h / 2 });
+              placed = true;
             }
-            if (pick >= 0) break;
           }
-          const h = hOf(pick);
-          c.items.push({ idx: pick, y: c.h, h });
-          c.h += h + gap;
-          used[pick]++;
-          if (P - c.h <= avg * 0.5) c.full = true;
+          misses = placed ? 0 : misses + 1;
         }
-
-        // make every column exactly P tall: stretch images a tiny bit (max 5%),
-        // spread whatever is left over the gaps
-        for (const c of cols) {
-          const S = c.items.reduce((sum, it) => sum + it.h, 0);
-          const f = clamp((P - c.items.length * gap) / S, 0.95, 1.05);
-          const extra = (P - S * f - c.items.length * gap) / c.items.length;
-          let y = 0;
-          for (const it of c.items) { it.h *= f; it.y = y; y += it.h + gap + extra; }
-        }
+        maxSide = Math.max(0, ...items.map((it) => Math.max(it.w, it.h)));
 
         // drop every live tile so it is rebuilt with the new sizes
         for (const el of active.values()) release(el);
@@ -360,7 +349,7 @@
         el._idx = item.idx;
         el._key = key;
         el.classList.remove('hidden');
-        el.style.width = colW + 'px';
+        el.style.width = item.w + 'px';
         el.style.height = item.h + 'px';
         el.style.display = '';
         return el;
@@ -374,25 +363,20 @@
 
       function render() {
         frame++;
-        const vw = innerWidth, vh = innerHeight, m = 160;
-        const k0 = Math.floor((cam.x - m) / stride);
-        const k1 = Math.floor((cam.x + vw + m) / stride);
-        for (let k = k0; k <= k1; k++) {
-          const col = cols[mod(k, nCols)];
-          const x = k * stride - cam.x;
-          const r0 = Math.floor((cam.y - m - col.phase) / col.P) - 1;
-          const r1 = Math.floor((cam.y + vh + m - col.phase) / col.P);
-          for (let r = r0; r <= r1; r++) {
-            const base = col.phase + r * col.P;
-            for (let i = 0; i < col.items.length; i++) {
-              const it = col.items[i];
-              const y = base + it.y;
-              if (y + it.h < cam.y - m || y > cam.y + vh + m) continue;
-              const key = k + '|' + r + '|' + i;
+        const vw = innerWidth, vh = innerHeight, m = 160, M = m + maxSide;
+        const ix0 = Math.floor((cam.x - M) / TW), ix1 = Math.floor((cam.x + vw + M) / TW);
+        const iy0 = Math.floor((cam.y - M) / TH), iy1 = Math.floor((cam.y + vh + M) / TH);
+        for (let ix = ix0; ix <= ix1; ix++) {
+          for (let iy = iy0; iy <= iy1; iy++) {
+            for (let i = 0; i < items.length; i++) {
+              const it = items[i];
+              const x = ix * TW + it.x, y = iy * TH + it.y;
+              if (x + it.w < cam.x - m || x > cam.x + vw + m || y + it.h < cam.y - m || y > cam.y + vh + m) continue;
+              const key = ix + '|' + iy + '|' + i;
               let el = active.get(key);
               if (!el) { el = acquire(it, key); active.set(key, el); }
               el._frame = frame;
-              el.style.transform = `translate3d(${x}px,${y - cam.y}px,0)`;
+              el.style.transform = `translate3d(${x - cam.x}px,${y - cam.y}px,0)`;
             }
           }
         }
@@ -401,7 +385,7 @@
         }
       }
 
-      // ---------------------------------------------------------------- grid input
+      // ---------------------------------------------------------------- drag / scroll input
       const gridVel = new Velocity();
       let g = null; // current grid drag
 
@@ -688,7 +672,7 @@
         IMGS = list;
         if (!IMGS.length) return;
         layout();
-        cam.x = Math.random() * nCols * stride;
+        cam.x = Math.random() * TW;
         cam.y = Math.random() * 4000;
         render();
         requestAnimationFrame(() => body.classList.add('ready'));
