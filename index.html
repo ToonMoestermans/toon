@@ -7,8 +7,8 @@
   <link rel="icon" href="data:,">
   <style>
     :root {
-      --bg: #e2e2e2;          /* page colour */
-      --tile: #e2e2e2;          /* colour shown while an image loads */
+      --bg: #000000;          /* page colour */
+      --tile: #000000;         /* colour shown while an image loads */
       --radius: 2px;          /* corner rounding of the images */
       --backdrop: rgba(239, 238, 233, 0.86);
     }
@@ -20,6 +20,8 @@
       background: var(--bg);
       overscroll-behavior: none;
     }
+
+    *, *::before, *::after { touch-action: none; }
 
     body {
       cursor: grab;
@@ -167,6 +169,9 @@
       const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
       const mod = (a, n) => ((a % n) + n) % n;
       const now = () => performance.now();
+      // size of the page itself — unlike innerWidth it stays the same if the phone zooms in
+      const VW = () => document.documentElement.clientWidth || window.innerWidth;
+      const VH = () => document.documentElement.clientHeight || window.innerHeight;
 
       function mulberry32(a) {
         return () => {
@@ -272,7 +277,7 @@
 
       function layout() {
         if (!IMGS.length) return; // images not loaded yet
-        const vw = innerWidth, vh = Math.max(innerHeight, screen.height || 0);
+        const vw = VW(), vh = Math.max(VH(), screen.height || 0);
         layoutW = vw;
         const base = vw < 640 ? vw * 0.42 : clamp(vw / 6.5, 150, 320); // normal image width
         const pad = base * GAP;
@@ -371,7 +376,7 @@
 
       function render() {
         frame++;
-        const vw = innerWidth, vh = innerHeight, m = 160, M = m + maxSide;
+        const vw = VW(), vh = VH(), m = 160, M = m + maxSide;
         const ix0 = Math.floor((cam.x - M) / TW), ix1 = Math.floor((cam.x + vw + M) / TW);
         const iy0 = Math.floor((cam.y - M) / TH), iy1 = Math.floor((cam.y + vh + M) / TH);
         for (let ix = ix0; ix <= ix1; ix++) {
@@ -437,7 +442,7 @@
       addEventListener('wheel', (e) => {
         e.preventDefault();
         if (card) return;
-        const m = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? innerHeight : 1;
+        const m = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? VH() : 1;
         cam.x += e.deltaX * m;
         cam.y += e.deltaY * m;
         camVel = { x: 0, y: 0 };
@@ -460,13 +465,13 @@
 
       function tileGeom(r) {
         return {
-          x: r.left + r.width / 2 - innerWidth / 2,
-          y: r.top + r.height / 2 - innerHeight / 2,
+          x: r.left + r.width / 2 - VW() / 2,
+          y: r.top + r.height / 2 - VH() / 2,
           s: r.width / card.W,
         };
       }
       function setCardGeometry() {
-        const vw = innerWidth, vh = innerHeight, small = vw < 640;
+        const vw = VW(), vh = VH(), small = vw < 640;
         const mw = vw * (small ? 0.88 : 0.78), mh = vh * (small ? 0.72 : 0.82);
         let W = mw, H = W / card.ar;
         if (H > mh) { H = mh; W = H * card.ar; }
@@ -556,8 +561,8 @@
       // point on the card (-1..1 from the centre) → that side tips away, like pressing on it
       function pressTilt(c, e) {
         const hw = (c.W * c.s) / 2, hh = (c.H * c.s) / 2;
-        const nx = (e.clientX - (innerWidth / 2 + c.x)) / hw;
-        const ny = (e.clientY - (innerHeight / 2 + c.y)) / hh;
+        const nx = (e.clientX - (VW() / 2 + c.x)) / hw;
+        const ny = (e.clientY - (VH() / 2 + c.y)) / hh;
         return { nx, ny };
       }
 
@@ -611,7 +616,7 @@
           const speed = Math.hypot(v.x, v.y);
           const dist = Math.hypot(c.x, c.y);
           if (e.type !== 'pointercancel' &&
-              (speed > CLOSE_FLICK || dist > Math.min(innerWidth, innerHeight) * CLOSE_DIST)) {
+              (speed > CLOSE_FLICK || dist > Math.min(VW(), VH()) * CLOSE_DIST)) {
             closeCard();
           } else {
             c.tx = 0; c.ty = 0; c.K = 260; c.D = 17; // springy return
@@ -703,14 +708,32 @@
       addEventListener('resize', () => {
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          if (innerWidth !== layoutW) layout();
+          if (VW() !== layoutW) layout();
           else dirty = true;
           if (card && !card.closing) setCardGeometry();
         }, 120);
       });
-      // stop Safari's pinch-zoom from zooming the whole page
-      ['gesturestart', 'gesturechange'].forEach((t) =>
-        document.addEventListener(t, (e) => e.preventDefault(), { passive: false }));
+      // Phones: never let the browser zoom the page (double-tap or pinch).
+      // Safari ignores the "no zoom" setting in the page header, so it's blocked here too.
+      const noZoom = (e) => e.preventDefault();
+      ['gesturestart', 'gesturechange', 'gestureend', 'dblclick'].forEach((t) =>
+        document.addEventListener(t, noZoom, { passive: false }));
+      document.addEventListener('touchmove', noZoom, { passive: false });
+      let lastTouchEnd = 0;
+      document.addEventListener('touchend', (e) => {
+        const t = now();
+        if (t - lastTouchEnd < 350) e.preventDefault(); // second tap of a double-tap
+        lastTouchEnd = t;
+      }, { passive: false });
+      // if a zoom slips through anyway, snap the page back to normal size
+      const meta = document.querySelector('meta[name=viewport]');
+      if (window.visualViewport) visualViewport.addEventListener('resize', () => {
+        if (visualViewport.scale > 1.01) {
+          const c = meta.content;
+          meta.content = c + ', minimum-scale=1';
+          requestAnimationFrame(() => { meta.content = c; });
+        }
+      });
 
       // ---------------------------------------------------------------- start
       loadImages().then((list) => {
