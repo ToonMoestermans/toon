@@ -79,13 +79,16 @@
     #backdrop {
       position: absolute;
       inset: 0;
+      background: transparent;
+      -webkit-backdrop-filter: blur(0px);
+      backdrop-filter: blur(0px);
+      transition: background-color 0.45s ease, -webkit-backdrop-filter 0.45s ease, backdrop-filter 0.45s ease;
+    }
+    #overlay.open #backdrop {
       background: var(--backdrop);
       -webkit-backdrop-filter: blur(14px);
       backdrop-filter: blur(14px);
-      opacity: 0;
-      transition: opacity 0.45s ease;
     }
-    #overlay.open #backdrop { opacity: 1; }
 
     .card {
       position: absolute;
@@ -125,6 +128,7 @@
       const MAX_FLING = 4500;        // px/s cap on grid fling speed
       const CLOSE_FLICK = 1400;      // px/s — flick the enlarged image this fast to close it
       const CLOSE_DIST = 0.32;       // …or drag it this far (fraction of the screen)
+      const TOUCH_TILT = 1.6;        // phones: how strongly the card tips where you press it
 
       // Every image in the images/ folder is shown — just add or remove files there.
       // On GitHub Pages the list of files is read from GitHub; when previewing on your
@@ -494,16 +498,32 @@
         setCardGeometry();
         const geo = tileGeom(tile.getBoundingClientRect());
         card.x = geo.x; card.y = geo.y; card.s = card.s0 = geo.s;
-        tile.classList.add('hidden');
         camVel = { x: 0, y: 0 };
         overlay.classList.add('active');
-        requestAnimationFrame(() => overlay.classList.add('open'));
         applyCard(0);
+
+        // keep the small tile showing until the big copy is ready to paint, so the card
+        // never flashes empty (big images take a moment to decode on phones)
+        const c = card;
+        c.waiting = true;
+        el.style.visibility = 'hidden';
+        const show = () => {
+          if (card !== c || !c.waiting) return;
+          c.waiting = false;
+          el.style.visibility = '';
+          tile.classList.add('hidden');
+          overlay.classList.add('open');
+        };
+        (img.decode ? img.decode() : Promise.resolve()).then(show, show);
+        setTimeout(show, 400);
       }
 
       function closeCard() {
         if (!card || card.closing) return;
         const c = card;
+        if (c.waiting) { // closed before it even appeared
+          c.el.remove(); overlay.classList.remove('active'); card = null; return;
+        }
         c.closing = true;
         c.dragging = false;
         c.hx = c.hy = 0;
@@ -533,13 +553,28 @@
         card = null;
       }
 
+      // point on the card (-1..1 from the centre) → that side tips away, like pressing on it
+      function pressTilt(c, e) {
+        const hw = (c.W * c.s) / 2, hh = (c.H * c.s) / 2;
+        const nx = (e.clientX - (innerWidth / 2 + c.x)) / hw;
+        const ny = (e.clientY - (innerHeight / 2 + c.y)) / hh;
+        return { nx, ny };
+      }
+
       overlay.addEventListener('pointerdown', (e) => {
         if (!card || card.closing) return;
         const c = card;
         if (e.target.closest('.card')) {
           c.dragging = true;
           c.ts = 1.04;
-          c.drag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: c.x, oy: c.y };
+          c.drag = { id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: c.x, oy: c.y,
+            touch: e.pointerType !== 'mouse' };
+          if (c.drag.touch) {
+            // on a phone there is no hover: the card tips towards where the finger presses
+            const { nx, ny } = pressTilt(c, e);
+            c.hx = clamp(nx, -1, 1) * TOUCH_TILT;
+            c.hy = clamp(ny, -1, 1) * TOUCH_TILT;
+          }
           cardVel.reset();
           cardVel.add(c.x, c.y);
           try { c.el.setPointerCapture(e.pointerId); } catch (_) {}
@@ -557,9 +592,7 @@
           cardVel.add(c.x, c.y);
         } else if (!c.closing && e.pointerType === 'mouse') {
           // subtle tilt towards the cursor
-          const hw = (c.W * c.s) / 2, hh = (c.H * c.s) / 2;
-          const nx = (e.clientX - (innerWidth / 2 + c.x)) / hw;
-          const ny = (e.clientY - (innerHeight / 2 + c.y)) / hh;
+          const { nx, ny } = pressTilt(c, e);
           const inside = Math.abs(nx) <= 1.15 && Math.abs(ny) <= 1.15;
           c.hx = inside ? clamp(nx, -1, 1) : 0;
           c.hy = inside ? clamp(ny, -1, 1) : 0;
@@ -571,6 +604,7 @@
         if (c.dragging && e.pointerId === c.drag.id) {
           c.dragging = false;
           c.ts = 1;
+          if (c.drag.touch) c.hx = c.hy = 0;
           body.classList.remove('dragging');
           const v = cardVel.get();
           c.vx = v.x; c.vy = v.y;
@@ -659,7 +693,7 @@
           } else camVel.x = camVel.y = 0;
         }
         if (dirty) { render(); dirty = false; }
-        if (card) stepCard(dt);
+        if (card && !card.waiting) stepCard(dt);
         requestAnimationFrame(tick);
       }
 
