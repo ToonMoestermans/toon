@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <title>Portfolio</title>
   <link rel="icon" href="data:,">
   <style>
@@ -144,7 +144,9 @@
         'bocheltje2.jpg',
         'bonk.jpg',
         'cat swirl.jpg',
+        'drawing3.webp',
         'elek cat.jpg',
+        'entangled 2.webp',
         'face.jpg',
         'migraine.webp',
         'snail.jpg',
@@ -265,7 +267,9 @@
       let TW = 1, TH = 1, maxSide = 0, items = [];
 
       function layout() {
-        const vw = innerWidth, vh = innerHeight;
+        if (!IMGS.length) return; // images not loaded yet
+        const vw = innerWidth, vh = Math.max(innerHeight, screen.height || 0);
+        layoutW = vw;
         const base = vw < 640 ? vw * 0.42 : clamp(vw / 6.5, 150, 320); // normal image width
         const pad = base * GAP;
         const rand = mulberry32(seed);
@@ -419,7 +423,8 @@
         const sp = Math.hypot(v.x, v.y);
         const f = sp > MAX_FLING ? MAX_FLING / sp : 1;
         camVel = { x: v.x * f, y: v.y * f };
-        if (!cancelled && g.moved < 6 && g.tile) openCard(g.tile);
+        const tapSlop = e.pointerType === 'mouse' ? 6 : 12;
+        if (!cancelled && g.moved < tapSlop && g.tile) openCard(g.tile);
         g = null;
       }
       world.addEventListener('pointerup', (e) => endGrid(e, false));
@@ -580,7 +585,7 @@
         } else if (c.backdrop && e.pointerId === c.backdrop.id) {
           const moved = Math.hypot(e.clientX - c.backdrop.x, e.clientY - c.backdrop.y);
           c.backdrop = null;
-          if (moved < 8 && e.type === 'pointerup') closeCard();
+          if (moved < 12 && e.type === 'pointerup') closeCard();
         }
       }
       overlay.addEventListener('pointerup', endCard);
@@ -658,14 +663,20 @@
         requestAnimationFrame(tick);
       }
 
-      let resizeTimer;
+      // Phones change the window height whenever the address bar slides in or out;
+      // only rebuild the layout when the width really changes (e.g. turning the phone).
+      let resizeTimer, layoutW = 0;
       addEventListener('resize', () => {
         clearTimeout(resizeTimer);
         resizeTimer = setTimeout(() => {
-          layout();
+          if (innerWidth !== layoutW) layout();
+          else dirty = true;
           if (card && !card.closing) setCardGeometry();
         }, 120);
       });
+      // stop Safari's pinch-zoom from zooming the whole page
+      ['gesturestart', 'gesturechange'].forEach((t) =>
+        document.addEventListener(t, (e) => e.preventDefault(), { passive: false }));
 
       // ---------------------------------------------------------------- start
       loadImages().then((list) => {
